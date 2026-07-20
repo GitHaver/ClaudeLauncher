@@ -1,0 +1,12 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Runtime state — created on first run, holds machine-specific paths
+launcher_state.json
+
+# Local Claude Code settings (personal permission grants, absolute paths)
+.claude/settings.local.json

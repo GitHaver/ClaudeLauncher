@@ -1,0 +1,6 @@
+customtkinter>=5.2.0
+
+# Optional — only needed to regenerate the app icon via generate_icon.py.
+# The prebuilt claude_launcher.ico/.png are already included, so the app
+# itself runs without this.
+Pillow>=10.0.0
