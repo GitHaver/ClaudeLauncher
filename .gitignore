@@ -1,3 +1,6 @@
+# Virtual environment (created on first run by run.bat)
+.venv/
+
 # Python build artifacts
 __pycache__/
 *.py[cod]

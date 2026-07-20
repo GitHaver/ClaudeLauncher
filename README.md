@@ -3,18 +3,33 @@
 A tiny desktop app to browse, create, and launch Claude Code projects — no
 manual `cd` + terminal dance.
 
-## Setup
+## Requirements
 
-```
-pip install -r requirements.txt
-```
+- Windows
+- Python 3.8+ on PATH — any of the `py` launcher, `python`, or `python3` works.
+  Check with `py --version` (or `python --version`).
 
 ## Run
 
-Double-click **`run.bat`**, or:
+Just double-click **`run.bat`**.
+
+On the **first** run it creates a local virtual environment (`.venv`) and
+installs dependencies into it, then launches the app. Every run after that
+launches straight away, with no console window. Because everything lives in the
+project's own `.venv`, it doesn't matter which Python is on your PATH or what
+else is installed globally.
+
+If the window closes unexpectedly, run **`run-debug.bat`** instead — it runs the
+app *with* a console window so you can read the error.
+
+### Manual / cross-checking
+
+If you'd rather set things up by hand (or aren't on Windows for development):
 
 ```
-python main.py
+py -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python main.py
 ```
 
 ## What it does
@@ -80,8 +95,9 @@ generic shell icon), so to get a nice launcher icon you make a **shortcut**:
 powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
 ```
 
-This creates **"Claude Launcher"** on your Desktop, pointing at
-`pythonw main.py` (no console window) with the custom icon. Pin it to the
+This creates **"Claude Launcher"** on your Desktop, pointing at the venv's
+`pythonw.exe` (no console window) with the custom icon. If the `.venv` doesn't
+exist yet, the script builds it first (same as `run.bat`). Pin it to the
 taskbar / Start if you like. Re-run the script any time to recreate it.
 
 The icon itself lives in `claude_launcher.ico` and is drawn by
