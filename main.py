@@ -293,7 +293,15 @@ class App(ctk.CTk):
         self._dirty = {}            # per-tab: needs re-render?
         self._search_after = None   # debounce handle
         self._anchor = None         # row to keep visually fixed across a rebuild
-        self._row_widgets = {}      # path -> row frame (current render)
+        # Rows are reused across renders rather than rebuilt: on each render we
+        # reconcile the live widgets against the desired list, only creating,
+        # updating, reordering or destroying the rows that actually changed.
+        self._row_widgets = {}      # path -> row frame
+        self._row_parts = {}        # path -> {sub-widget name: widget}
+        self._row_desc = {}         # path -> last descriptor rendered
+        self._row_order = []        # path list in current pack order
+        self._active_frame = None   # which tab's frame the rows belong to
+        self._empty_widget = None   # "no projects" placeholder label
         # Existence (isdir/isfile) is cached and refreshed off the UI thread.
         # Rendering NEVER stats the filesystem — a per-row stat on the UI
         # thread stalls hard where file access is slow (network paths, AV/EDR).
@@ -399,9 +407,17 @@ class App(ctk.CTk):
         else:
             frame, paths, hint = self.proj_frame, vis, True
 
+        # Switching which tab is on screen: the other tab's rows belong to a
+        # different frame, so drop them (they rebuild lazily when reshown).
+        if self._active_frame is not frame:
+            self._clear_rows()
+            self._active_frame = frame
+
+        descriptors, empty_msg = self._compute_rows(paths, empty_hint=hint)
+
         anchor = self._anchor
         self._anchor = None
-        # Measure the anchor row's on-screen offset before we tear it down.
+        # Measure the anchor row's on-screen offset before we reorder.
         anchor_offset = None
         if anchor and anchor in self._row_widgets:
             w = self._row_widgets[anchor]
@@ -413,10 +429,7 @@ class App(ctk.CTk):
                 anchor_offset = None
         frac = self._get_scroll(frame)          # fallback: preserve scroll ratio
 
-        self._row_widgets = {}
-        for w in frame.winfo_children():
-            w.destroy()
-        self._render_tree(frame, paths, empty_hint=hint)
+        self._sync_rows(frame, descriptors, empty_msg)
         frame.update_idletasks()
 
         def restore():
@@ -465,7 +478,13 @@ class App(ctk.CTk):
             self.after_cancel(self._search_after)
         self._search_after = self.after(140, self.on_search)
 
-    def _render_tree(self, container, paths, empty_hint):
+    def _compute_rows(self, paths, empty_hint):
+        """Return (ordered list of row descriptors, empty-message-or-None).
+
+        Pure data — no widgets are created here. The descriptor for each row
+        captures everything that affects how it looks, so a later render can
+        tell whether a live row needs updating just by comparing descriptors.
+        """
         q = self.query
         m = self.store.projects
 
@@ -525,14 +544,16 @@ class App(ctk.CTk):
                 return (0, -(m[p].get("last_accessed") or 0))
             return (1, -sortkey(p))
 
+        out = []
+
         def render(p, depth):
             if not keep(p):
                 return
             inline = [c for c in eff_children.get(p, []) if not pinned(c)]
-            collapsed = m[p].get("collapsed") and not q
-            self._make_row(container, p, depth,
-                           has_group=bool(inline), collapsed=collapsed,
-                           groupable=nat_parent.get(p) is not None)
+            collapsed = bool(m[p].get("collapsed")) and not q
+            out.append(self._descriptor(
+                p, depth, has_group=bool(inline), collapsed=collapsed,
+                groupable=nat_parent.get(p) is not None))
             if collapsed:
                 return
             for c in sorted(inline, key=sortkey, reverse=True):
@@ -551,11 +572,30 @@ class App(ctk.CTk):
                        'or "Create New…".')
             else:
                 msg = "No matches." if q else "Nothing hidden."
-            ctk.CTkLabel(container, text=msg, text_color="gray").pack(pady=24)
-            return
+            return [], msg
 
         for r in sorted(display_roots, key=top_key):
             render(r, 0)
+        return out, None
+
+    def _descriptor(self, p, depth, has_group, collapsed, groupable):
+        """Snapshot of every input that affects how row `p` is drawn."""
+        m = self.store.projects[p]
+        app = m.get("launch_app") or None
+        return {
+            "path": p,
+            "depth": depth,
+            "has_group": has_group,
+            "collapsed": collapsed,
+            "groupable": groupable,
+            "pinned": bool(m.get("pinned")),
+            "detached": bool(m.get("detached")),
+            "hidden": bool(m.get("hidden")),
+            "exists": self._exists.get(p, True),
+            "last_accessed": m.get("last_accessed"),
+            "app": app,
+            "app_missing": app is not None and self._exists.get(app) is False,
+        }
 
     def _tkbtn(self, parent, text, cmd, bg=SEC_BG, hov=SEC_HOV, fg=TXT,
               width=None, font=None, border=None):
@@ -570,9 +610,28 @@ class App(ctk.CTk):
                       font=font or self.f_btn, padx=6, pady=3)
         if width:
             b.configure(width=width)
-        b.bind("<Enter>", lambda _e: b["state"] == "normal" and b.configure(bg=hov))
-        b.bind("<Leave>", lambda _e: b.configure(bg=bg))
+        # Store the base/hover colours on the widget so the hover handlers read
+        # the *current* colours — a row's buttons get recoloured in place when
+        # its state changes (pin, app link), and a captured colour would leave
+        # the hover restoring the old one.
+        b._bg, b._hov = bg, hov
+        b.bind("<Enter>", lambda _e, w=b:
+               w.configure(bg=w._hov) if str(w["state"]) == "normal" else None)
+        b.bind("<Leave>", lambda _e, w=b: w.configure(bg=w._bg))
         return b
+
+    @staticmethod
+    def _recolor(btn, bg, hov):
+        """Change a button's base + hover colours (keeps hover correct)."""
+        btn._bg, btn._hov = bg, hov
+        btn.configure(bg=bg, activebackground=hov)
+
+    @staticmethod
+    def _set_enabled(btn, enabled):
+        if enabled:
+            btn.configure(state="normal", cursor="hand2")
+        else:
+            btn.configure(state="disabled", cursor="arrow")
 
     def _blank_slot(self, parent, width=2, font=None, border=None):
         """An inert, invisible button-sized spacer — reserves a column so the
@@ -584,124 +643,278 @@ class App(ctk.CTk):
                     highlightbackground=ROW_BG, highlightcolor=ROW_BG)
         return b
 
-    def _make_row(self, container, path, depth,
-                  has_group=False, collapsed=False, groupable=False):
-        meta = self.store.projects[path]
-        # Read existence from the background cache (default optimistic: assume
-        # present until a check proves otherwise), never stat here.
-        exists = self._exists.get(path, True)
+    # ---- row reconciliation --------------------------------------------- #
+    def _clear_rows(self):
+        """Destroy all live rows and the empty placeholder (tab switch)."""
+        for w in self._row_widgets.values():
+            w.destroy()
+        self._row_widgets = {}
+        self._row_parts = {}
+        self._row_desc = {}
+        self._row_order = []
+        if self._empty_widget is not None:
+            self._empty_widget.destroy()
+            self._empty_widget = None
 
+    def _sync_rows(self, container, descriptors, empty_msg):
+        """Reconcile live row widgets against the desired descriptor list.
+
+        Creates rows for new paths, updates rows whose descriptor changed,
+        destroys rows that vanished, and reorders with minimal moves. Rows
+        that are unchanged and unmoved are left completely untouched — the
+        whole point: no teardown, no flash, near-instant interactions.
+        """
+        new_order = [d["path"] for d in descriptors]
+        new_set = set(new_order)
+
+        # 1. Destroy rows no longer present.
+        for p in list(self._row_widgets):
+            if p not in new_set:
+                self._row_widgets.pop(p).destroy()
+                self._row_parts.pop(p, None)
+                self._row_desc.pop(p, None)
+
+        # 2. Empty list → show the placeholder, drop any rows, done.
+        if not new_order:
+            if self._empty_widget is None:
+                self._empty_widget = ctk.CTkLabel(
+                    container, text=empty_msg or "", text_color="gray")
+                self._empty_widget.pack(pady=24)
+            else:
+                self._empty_widget.configure(text=empty_msg or "")
+            self._row_order = []
+            return
+        if self._empty_widget is not None:
+            self._empty_widget.destroy()
+            self._empty_widget = None
+
+        # 3. Create new rows (unpacked) and update changed ones.
+        forced = set()                       # rows that must be (re)packed
+        for d in descriptors:
+            p = d["path"]
+            old = self._row_desc.get(p)
+            if p not in self._row_widgets:
+                self._build_row(container, p)
+                self._apply_row(p, d)
+            elif old != d:
+                self._apply_row(p, d)
+                if old is not None and old["depth"] != d["depth"]:
+                    forced.add(p)            # indent changed → needs re-pack
+            self._row_desc[p] = d
+
+        # 4. Reorder to match new_order, moving as few rows as possible.
+        self._reorder(new_order, forced)
+        self._row_order = new_order
+
+    @staticmethod
+    def _lcs(a, b):
+        """Set of items forming a longest common subsequence of a and b.
+
+        Items are unique within each list (project paths), so this identifies
+        the rows that already sit in the right relative order and can stay put.
+        """
+        n, m = len(a), len(b)
+        if not n or not m:
+            return set()
+        dp = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(n - 1, -1, -1):
+            for j in range(m - 1, -1, -1):
+                dp[i][j] = (dp[i + 1][j + 1] + 1 if a[i] == b[j]
+                            else max(dp[i + 1][j], dp[i][j + 1]))
+        keep = set()
+        i = j = 0
+        while i < n and j < m:
+            if a[i] == b[j]:
+                keep.add(a[i]); i += 1; j += 1
+            elif dp[i + 1][j] >= dp[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return keep
+
+    def _reorder(self, new_order, forced):
+        """Pack rows into new_order, repacking only rows that must move."""
+        survivors = [p for p in self._row_order if p in self._row_widgets]
+        if survivors == new_order and not forced:
+            return                            # nothing moved — common fast path
+        if not survivors:
+            stable = set()
+        elif survivors == new_order:
+            stable = set(new_order)
+        else:
+            stable = self._lcs(survivors, new_order)
+        stable -= forced
+
+        for i, p in enumerate(new_order):
+            if p in stable:
+                continue
+            before = None
+            for q in new_order[i + 1:]:
+                if q in stable:
+                    before = self._row_widgets[q]
+                    break
+            depth = self._row_desc[p]["depth"]
+            opts = {"fill": "x", "padx": (6 + depth * 26, 6), "pady": 3}
+            if before is not None:                # None → append at the end
+                opts["before"] = before
+            self._row_widgets[p].pack_configure(**opts)
+
+    # ---- row widgets ---------------------------------------------------- #
+    def _build_row(self, container, path):
+        """Create a row's full (reusable) widget skeleton, unpacked.
+
+        Every widget the row can ever need is created once here; _apply_row
+        then just reconfigures text/colour/state and shows or hides the few
+        mode-specific pieces (gutter icon, ⚙ vs spacer, the App: line). The
+        row frame itself is packed later by _reorder.
+        """
+        parts = {}
         row = tk.Frame(container, bg=ROW_BG)
-        row.pack(fill="x", padx=(6 + depth * 26, 6), pady=3)
         self._row_widgets[path] = row
 
         # Left gutter — one column so every name label starts at the same x.
-        # A root with children shows the collapse/expand toggle; a nested leaf
-        # shows the ungroup/regroup toggle. Flattening (see _render_tree) means
-        # a project is never both, so these never collide.
+        # Holds a single toggle button (collapse/expand for a group root, or
+        # ungroup/regroup for a nested leaf) or an invisible spacer; only one
+        # is shown at a time (flattening guarantees never both — see
+        # _compute_rows).
         gutter = tk.Frame(row, bg=ROW_BG)
         gutter.pack(side="left", padx=(4, 0), pady=4)
-
-        if has_group:
-            self._tkbtn(gutter, "▶" if collapsed else "▼",
-                        lambda p=path: self.on_toggle_collapse(p),
-                        bg=ROW_BG, hov=SEC_BG, width=2, font=self.f_arrow
-                        ).pack(side="left")
-        elif groupable and not meta.get("pinned"):
-            # While pinned, the star governs placement (the row floats to the
-            # favourites section), so the ungroup arrow is hidden. The detach
-            # state is left untouched, so unfavouriting restores it: grouped
-            # rows fall back under their parent, detached rows stay standalone.
-            self._tkbtn(gutter, "⇥" if meta.get("detached") else "⇤",
-                        lambda p=path: self.on_toggle_detach(p),
-                        bg=ROW_BG, hov=SEC_BG, width=2, font=self.f_arrow
-                        ).pack(side="left")
-        else:
-            self._blank_slot(gutter, width=2, font=self.f_arrow).pack(side="left")
+        parts["gutter_btn"] = self._tkbtn(gutter, "", None, bg=ROW_BG,
+                                          hov=SEC_BG, width=2, font=self.f_arrow)
+        parts["gutter_blank"] = self._blank_slot(gutter, width=2,
+                                                 font=self.f_arrow)
+        parts["gutter_mode"] = None
 
         info = tk.Frame(row, bg=ROW_BG)
         info.pack(side="left", fill="x", expand=True, padx=8, pady=5)
-
-        name = os.path.basename(path) or path
-        tags = []
-        if meta.get("pinned"):
-            tags.append("★")
-        if meta.get("detached"):
-            tags.append("ungrouped")
-        if not exists:
-            tags.append("missing")
-        title = name + (f"   ({', '.join(tags)})" if tags else "")
-        tk.Label(info, text=title, bg=ROW_BG, fg=TXT, anchor="w",
-                 font=self.f_title).pack(fill="x")
+        parts["name"] = os.path.basename(path) or path
+        parts["title"] = tk.Label(info, text="", bg=ROW_BG, fg=TXT, anchor="w",
+                                  font=self.f_title)
+        parts["title"].pack(fill="x")
         tk.Label(info, text=path, bg=ROW_BG, fg=SUB, anchor="w",
                  font=self.f_sub).pack(fill="x")
-
-        la = meta.get("last_accessed")
-        la_txt = ("Last opened: "
-                  + (datetime.fromtimestamp(la).strftime("%Y-%m-%d %H:%M")
-                     if la else "never"))
-        tk.Label(info, text=la_txt, bg=ROW_BG, fg=SUB, anchor="w",
-                 font=self.f_sub).pack(fill="x")
-
-        app = meta.get("launch_app")
-        if app:
-            missing = "  (missing)" if self._exists.get(app) is False else ""
-            tk.Label(info, text=f"App: {os.path.basename(app)}{missing}",
-                     bg=ROW_BG, fg=SUB, anchor="w",
-                     font=self.f_sub).pack(fill="x")
+        parts["la"] = tk.Label(info, text="", bg=ROW_BG, fg=SUB, anchor="w",
+                               font=self.f_sub)
+        parts["la"].pack(fill="x")
+        parts["app"] = tk.Label(info, text="", bg=ROW_BG, fg=SUB, anchor="w",
+                                font=self.f_sub)          # packed on demand
+        parts["app_shown"] = False
 
         btns = tk.Frame(row, bg=ROW_BG)
         btns.pack(side="right", padx=6)
-
-        pinned = meta.get("pinned")
-        self._tkbtn(btns, "★" if pinned else "☆",
-                    lambda p=path: self.on_toggle_pin(p),
-                    bg=PIN_BG if pinned else SEC_BG,
-                    hov=PIN_HOV if pinned else SEC_HOV, width=2).pack(side="left", padx=3)
-
-        launch = self._tkbtn(btns, "▶ Launch", lambda p=path: self.on_launch(p),
-                             bg=PRI_BG, hov=PRI_HOV)
-        if not exists:
-            launch.configure(state="disabled", cursor="arrow")
-        launch.pack(side="left", padx=3)
-
+        parts["pin"] = self._tkbtn(btns, "☆", lambda p=path: self.on_toggle_pin(p),
+                                   width=2)
+        parts["pin"].pack(side="left", padx=3)
+        parts["launch"] = self._tkbtn(btns, "▶ Launch",
+                                      lambda p=path: self.on_launch(p),
+                                      bg=PRI_BG, hov=PRI_HOV)
+        parts["launch"].pack(side="left", padx=3)
         # Launch App: always the rocket. Filled green once linked to a file,
-        # green outline (no fill) until then. First click on an unlinked one
-        # asks for the file to run. The ⚙ button edits that choice; when there
-        # is nothing to edit an invisible slot holds its place so the rocket /
-        # Launch / ★ columns stay aligned across every row.
-        app_set = bool(meta.get("launch_app"))
-        app_btn = self._tkbtn(
-            btns, "🚀 App", lambda p=path: self.on_launch_app(p),
-            bg=APP_BG if app_set else ROW_BG,
-            hov=APP_HOV if app_set else APP_OUT_HOV,
-            border=APP_BORDER)
-        if not exists:
-            app_btn.configure(state="disabled", cursor="arrow")
-        app_btn.pack(side="left", padx=3)
-
-        if app_set:
-            # U+FE0E forces monochrome/text presentation; without it Windows
-            # draws ⚙ as an oversized colour emoji that inflates the button.
-            self._tkbtn(btns, "⚙︎", lambda p=path: self.on_edit_launch_app(p),
-                        bg=APP_BG, hov=APP_HOV, width=2, border=APP_BORDER
-                        ).pack(side="left", padx=3)
-        else:
-            self._blank_slot(btns, width=2,
-                             border=APP_BORDER).pack(side="left", padx=3)
-
-        openf = self._tkbtn(btns, "📁", lambda p=path: self.on_open_folder(p),
-                            width=3)
-        if not exists:
-            openf.configure(state="disabled", cursor="arrow")
-        openf.pack(side="left", padx=3)
-
-        hide_txt = "Unhide" if meta.get("hidden") else "Hide"
-        self._tkbtn(btns, hide_txt,
-                    lambda p=path: self.on_toggle_hide(p)).pack(side="left", padx=3)
-
+        # green outline (no fill) until then. The ⚙ button edits that choice;
+        # when there is nothing to edit an invisible slot holds its place so
+        # the rocket / Launch / ★ columns stay aligned across every row.
+        parts["appbtn"] = self._tkbtn(btns, "🚀 App",
+                                      lambda p=path: self.on_launch_app(p),
+                                      bg=ROW_BG, hov=APP_OUT_HOV, border=APP_BORDER)
+        parts["appbtn"].pack(side="left", padx=3)
+        # U+FE0E on the gear forces monochrome/text presentation; without it
+        # Windows draws an oversized colour emoji that inflates the button.
+        parts["gear"] = self._tkbtn(btns, "⚙︎",
+                                    lambda p=path: self.on_edit_launch_app(p),
+                                    bg=APP_BG, hov=APP_HOV, width=2,
+                                    border=APP_BORDER)
+        parts["gear_blank"] = self._blank_slot(btns, width=2, border=APP_BORDER)
+        parts["gear_mode"] = None
+        parts["open"] = self._tkbtn(btns, "📁",
+                                    lambda p=path: self.on_open_folder(p), width=3)
+        parts["open"].pack(side="left", padx=3)
+        parts["hide"] = self._tkbtn(btns, "Hide",
+                                    lambda p=path: self.on_toggle_hide(p))
+        parts["hide"].pack(side="left", padx=3)
         self._tkbtn(btns, "✕", lambda p=path: self.on_remove(p),
                     bg=ROW_BG, hov=DEL_HOV, fg=SUB, width=2).pack(side="left", padx=3)
+
+        self._row_parts[path] = parts
+
+    def _apply_row(self, path, d):
+        """Reconfigure a live row's widgets to match descriptor `d`."""
+        parts = self._row_parts[path]
+        exists = d["exists"]
+
+        # Gutter: pick toggle (with the right glyph/command) or spacer.
+        gb, blank = parts["gutter_btn"], parts["gutter_blank"]
+        if d["has_group"]:
+            gb.configure(text="▶" if d["collapsed"] else "▼",
+                         command=lambda p=path: self.on_toggle_collapse(p))
+            mode = "btn"
+        elif d["groupable"] and not d["pinned"]:
+            # While pinned the star governs placement (the row floats to the
+            # favourites section), so the ungroup arrow is hidden; the detach
+            # flag is left untouched so unfavouriting restores the grouping.
+            gb.configure(text="⇥" if d["detached"] else "⇤",
+                         command=lambda p=path: self.on_toggle_detach(p))
+            mode = "btn"
+        else:
+            mode = "blank"
+        if parts["gutter_mode"] != mode:
+            if mode == "btn":
+                blank.pack_forget(); gb.pack(side="left")
+            else:
+                gb.pack_forget(); blank.pack(side="left")
+            parts["gutter_mode"] = mode
+
+        # Title + tags.
+        tags = []
+        if d["pinned"]:
+            tags.append("★")
+        if d["detached"]:
+            tags.append("ungrouped")
+        if not exists:
+            tags.append("missing")
+        parts["title"].configure(
+            text=parts["name"] + (f"   ({', '.join(tags)})" if tags else ""))
+
+        # Last opened.
+        la = d["last_accessed"]
+        parts["la"].configure(
+            text="Last opened: " + (datetime.fromtimestamp(la)
+                                    .strftime("%Y-%m-%d %H:%M") if la else "never"))
+
+        # App: line (shown only when a launch app is linked).
+        app = d["app"]
+        if app:
+            miss = "  (missing)" if d["app_missing"] else ""
+            parts["app"].configure(text=f"App: {os.path.basename(app)}{miss}")
+            if not parts["app_shown"]:
+                parts["app"].pack(fill="x"); parts["app_shown"] = True
+        elif parts["app_shown"]:
+            parts["app"].pack_forget(); parts["app_shown"] = False
+
+        # Pin star.
+        self._recolor(parts["pin"], PIN_BG if d["pinned"] else SEC_BG,
+                      PIN_HOV if d["pinned"] else SEC_HOV)
+        parts["pin"].configure(text="★" if d["pinned"] else "☆")
+
+        # Launch / App / Open are disabled when the folder is gone.
+        self._set_enabled(parts["launch"], exists)
+        app_set = app is not None
+        self._recolor(parts["appbtn"], APP_BG if app_set else ROW_BG,
+                      APP_HOV if app_set else APP_OUT_HOV)
+        self._set_enabled(parts["appbtn"], exists)
+
+        # ⚙ edit button vs invisible spacer.
+        mode = "gear" if app_set else "blank"
+        if parts["gear_mode"] != mode:
+            if app_set:
+                parts["gear_blank"].pack_forget()
+                parts["gear"].pack(before=parts["open"], side="left", padx=3)
+            else:
+                parts["gear"].pack_forget()
+                parts["gear_blank"].pack(before=parts["open"], side="left", padx=3)
+            parts["gear_mode"] = mode
+
+        self._set_enabled(parts["open"], exists)
+        parts["hide"].configure(text="Unhide" if d["hidden"] else "Hide")
 
     # ---- actions --------------------------------------------------------- #
     def on_launch(self, path):
