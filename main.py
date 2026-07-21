@@ -398,18 +398,23 @@ class App(ctk.CTk):
 
     def _render_active(self):
         name = self.tabs.get()
-        if not self._dirty.get(name, True):
-            return
-        self._dirty[name] = False
         vis, hid = self._visible_hidden()
         if name == "Hidden":
             frame, paths, hint = self.hidden_frame, hid, False
         else:
             frame, paths, hint = self.proj_frame, vis, True
 
-        # Switching which tab is on screen: the other tab's rows belong to a
-        # different frame, so drop them (they rebuild lazily when reshown).
-        if self._active_frame is not frame:
+        # Switching which tab is on screen clears the other tab's rows, so a
+        # tab switch must always re-render even if this tab was marked clean —
+        # otherwise we'd return with an empty frame. Only skip the render when
+        # we're staying on the same tab and nothing changed.
+        switching = self._active_frame is not frame
+        if not switching and not self._dirty.get(name, True):
+            return
+        self._dirty[name] = False
+
+        if switching:
+            # The other tab's rows belong to a different frame; drop them.
             self._clear_rows()
             self._active_frame = frame
 
