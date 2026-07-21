@@ -294,6 +294,12 @@ class App(ctk.CTk):
         self._search_after = None   # debounce handle
         self._anchor = None         # row to keep visually fixed across a rebuild
         self._row_widgets = {}      # path -> row frame (current render)
+        # Existence (isdir/isfile) is cached and refreshed off the UI thread.
+        # Rendering NEVER stats the filesystem — a per-row stat on the UI
+        # thread stalls hard where file access is slow (network paths, AV/EDR).
+        self._exists = {}           # path/file -> bool
+        self._exists_busy = False   # a background check is in flight
+        self._exists_again = False  # another was requested while busy
 
         self.title("Claude Launcher")
         self.geometry("860x620")
@@ -378,6 +384,9 @@ class App(ctk.CTk):
             text=f"{len(vis)} projects · {len(hid)} hidden · "
                  f"{len(self.store.scan_roots)} scan root(s)"
         )
+        # Refresh the existence cache in the background; if anything actually
+        # changed on disk, the current tab re-renders once the check returns.
+        self._start_existence_scan()
 
     def _render_active(self):
         name = self.tabs.get()
@@ -578,7 +587,9 @@ class App(ctk.CTk):
     def _make_row(self, container, path, depth,
                   has_group=False, collapsed=False, groupable=False):
         meta = self.store.projects[path]
-        exists = os.path.isdir(path)
+        # Read existence from the background cache (default optimistic: assume
+        # present until a check proves otherwise), never stat here.
+        exists = self._exists.get(path, True)
 
         row = tk.Frame(container, bg=ROW_BG)
         row.pack(fill="x", padx=(6 + depth * 26, 6), pady=3)
@@ -634,7 +645,7 @@ class App(ctk.CTk):
 
         app = meta.get("launch_app")
         if app:
-            missing = "  (missing)" if not os.path.isfile(app) else ""
+            missing = "  (missing)" if self._exists.get(app) is False else ""
             tk.Label(info, text=f"App: {os.path.basename(app)}{missing}",
                      bg=ROW_BG, fg=SUB, anchor="w",
                      font=self.f_sub).pack(fill="x")
@@ -940,6 +951,59 @@ class App(ctk.CTk):
             return
 
         self.after(80, self._poll_scan, q)
+
+    # ---- background existence cache ------------------------------------- #
+    def _start_existence_scan(self):
+        """Re-check every project dir / launch-app file off the UI thread.
+
+        Only one runs at a time; a request made while busy is coalesced into a
+        single follow-up. When the results differ from the cache, the current
+        tab is re-rendered so "missing" tags appear/clear.
+        """
+        if self._exists_busy:
+            self._exists_again = True
+            return
+        self._exists_busy = True
+        self._exists_again = False
+        projects = list(self.store.projects.keys())
+        apps = [m["launch_app"] for m in self.store.projects.values()
+                if m.get("launch_app")]
+        q = queue.Queue()
+        threading.Thread(target=self._existence_worker,
+                         args=(projects, apps, q), daemon=True).start()
+        self.after(60, self._poll_existence, q)
+
+    @staticmethod
+    def _existence_worker(projects, apps, q):
+        result = {}
+        for p in projects:
+            try:
+                result[p] = os.path.isdir(p)
+            except OSError:
+                result[p] = False
+        for a in apps:
+            try:
+                result[a] = os.path.isfile(a)
+            except OSError:
+                result[a] = False
+        q.put(result)
+
+    def _poll_existence(self, q):
+        try:
+            result = q.get_nowait()
+        except queue.Empty:
+            self.after(60, self._poll_existence, q)
+            return
+        self._exists_busy = False
+        changed = result != self._exists
+        self._exists = result
+        if self._exists_again:
+            self._start_existence_scan()
+        if changed:
+            # Existence actually moved — repaint the visible tab so the
+            # missing/present state is up to date. (No-op in steady state.)
+            self._dirty[self.tabs.get()] = True
+            self._render_active()
 
     def on_add_existing(self):
         """Pick any existing folder, add it to the list, and launch claude."""
